@@ -1,4 +1,4 @@
-# 🎵 小蠑螈 - Discord 強大的Discord 機器人
+# 🎵 小蠑螈 - 強大的Discord 機器人
 
 ![小蠑螈-端午節特別版](/icon/dragon_boat_festival_version.png)
 使用Google Imagen 3 以及 Gemini 2.0 Flash 生成
