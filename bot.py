@@ -1,5 +1,3 @@
-# pip install python-dotenv discord.py[voice] yt-dlp
-
 import asyncio
 import datetime
 import logging
