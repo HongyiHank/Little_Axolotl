@@ -587,15 +587,15 @@ def adjust_sources(sources: List[YTDLSource], current_queue_length: int) -> Tupl
 def create_ffmpeg_audio(url: str, start: float = 0.0) -> discord.FFmpegPCMAudio:
     """建立 FFmpeg 音頻源"""
     
-    before_options = '-re -thread_queue_size 8192'
+    before_options = '-thread_queue_size 8192'
     
     
     if start > 0:
         before_options += f" -ss {start}"
         
-    before_options += ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -rw_timeout 60000'
+    before_options += ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 5000000'
     
-    processing_options = '-vn -bufsize 3072k -loglevel error'
+    processing_options = '-vn -loglevel error'
     try:
         return discord.FFmpegPCMAudio(
             url,
