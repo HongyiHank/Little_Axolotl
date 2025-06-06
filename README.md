@@ -67,7 +67,7 @@
 
 ## 📝 貢獻
 
-> 歡迎提交 Pull Request，提交過後您的大名將會出現在貢獻者清單中
+> 歡迎提交 Pull Request，提交過後您的大名將會出現在貢獻者清單中<br>
 > Pull Request 請提交到`dev`分支
 
 ## 📄 授權
