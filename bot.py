@@ -7,6 +7,7 @@ import time
 import weakref
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+import concurrent.futures # 用於並行處理 yt-dlp
 
 import discord
 from discord import ui
@@ -14,12 +15,12 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp as youtube_dl
 
-# 載入環境變數配置
+# 載入環境變數
 load_dotenv()
 
-# === 統一的環境變數讀取函數 ===
+# 環境變數讀取器
 def get_env_value(key: str, default: Any, value_type: type = str) -> Any:
-    """統一的環境變數讀取函數，支援多種類型"""
+    """讀取環境變數，支援類型轉換和預設值"""
     try:
         value = os.getenv(key, str(default))
         if value_type == bool:
@@ -31,11 +32,11 @@ def get_env_value(key: str, default: Any, value_type: type = str) -> Any:
         logging.warning(f"環境變數 {key} 值無效: {os.getenv(key)}，使用預設值 {default}")
         return default
 
-# === 系統配置常數 ===
+# 系統配置
 YTDL_TIMEOUT = get_env_value('YTDL_TIMEOUT', 30.0, float)
 CACHE_LIMIT = get_env_value('CACHE_LIMIT', 1000, int)
 MAX_PLAYLIST_ITEMS = get_env_value('MAX_PLAYLIST', 50, int)
-BUTTON_TIMEOUT_SECONDS = get_env_value('BUTTON_TIMEOUT', 60, int)
+BUTTON_TIMEOUT_SECONDS = get_env_value('BUTTON_TIMEOUT', 180, int)
 DEFAULT_VOLUME = get_env_value('DEFAULT_VOLUME', 1.0, float)
 MAX_QUEUE_LENGTH = get_env_value('MAX_QUEUE_LENGTH', 100, int)
 QUEUE_PAGE_SIZE = get_env_value('QUEUE_PAGE_SIZE', 10, int)
@@ -47,7 +48,7 @@ CASE_INSENSITIVE = get_env_value('CASE_INSENSITIVE', True, bool)
 ERROR_RATE_LIMIT = get_env_value('ERROR_RATE_LIMIT', 5, int)
 ERROR_COOLDOWN = get_env_value('ERROR_COOLDOWN', 60, int)
 
-# === 支援的 YouTube 網域清單 ===
+# 支援的 YouTube 網域
 VALID_DOMAINS = tuple(get_env_value('VALID_DOMAINS', [
     'https://www.youtube.com/',
     'https://youtube.com/',
@@ -55,16 +56,16 @@ VALID_DOMAINS = tuple(get_env_value('VALID_DOMAINS', [
     'https://music.youtube.com/'
 ], list))
 
-# === YouTube-DL 核心配置 ===
+# yt-dlp 核心配置
 YDL_OPTIONS = {
     'format': os.getenv('YTDL_FORMAT', '251'),
-    'noplaylist': get_env_value('YTDL_NO_PLAYLIST', False, bool),
     'nocheckcertificate': get_env_value('YTDL_NO_CHECK_CERTIFICATE', True, bool),
     'ignoreerrors': get_env_value('YTDL_IGNORE_ERRORS', True, bool),
     'quiet': get_env_value('YTDL_QUIET', True, bool),
     'no_warnings': get_env_value('YTDL_NO_WARNINGS', True, bool),
     'default_search': 'ytsearch:',
     'source_address': '0.0.0.0',
+    'noplaylist': False,
     'skip_download': True,
     'extract_flat': 'in_playlist',
     'lazy_playlist': True,
@@ -73,7 +74,7 @@ YDL_OPTIONS = {
     }
 }
 
-# === Discord 機器人初始化 ===
+# Discord 機器人初始化
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -84,17 +85,36 @@ bot = commands.Bot(
     case_insensitive=CASE_INSENSITIVE
 )
 
+# 為 yt-dlp 建立行程池，避免阻塞主事件循環
+process_executor = concurrent.futures.ProcessPoolExecutor(max_workers=2)
+
 logger = logging.getLogger('discord.music_bot')
 
-# === 錯誤處理增強配置 ===
+# 獨立的 yt-dlp 提取函數
+def run_ytdlp_extraction(url: str, ydl_opts: dict) -> Dict:
+    """
+    在獨立行程中執行 yt-dlp 提取。
+    必須為頂層函數以便 pickle 傳遞。
+    """
+    try:
+        # 在子行程中建立新的 ydl 實例
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        # 將異常資訊以可序列化的方式傳回主行程
+        logging.error(f"YTDL-Process-Error for url {url}: {e}", exc_info=True)
+        return {'_type': 'error', 'error': str(e)}
+
+
+# 錯誤頻率限制器
 class ErrorRateLimiter:
-    """錯誤頻率限制器"""
+    """限制特定伺服器和錯誤類型的日誌頻率，避免洗版"""
     def __init__(self):
         self.error_counts = {}
         self.suppressed_errors = set()
     
     def should_log_error(self, guild_id: int, error_type: str) -> bool:
-        """檢查是否應該記錄錯誤"""
+        """檢查特定錯誤是否應被記錄"""
         current_time = time.time()
         
         if guild_id not in self.error_counts:
@@ -124,9 +144,9 @@ def safe_log_error(guild_id: int, error_type: str, message: str, exc_info=None):
     if error_limiter.should_log_error(guild_id, error_type):
         logger.error(f"[Guild {guild_id}] {message}", exc_info=exc_info)
 
-# === 自訂例外類別 ===
+# 自訂例外
 class MusicError(Exception):
-    """音樂播放相關錯誤的基礎類別"""
+    """音樂功能相關錯誤的基底類別"""
     pass
 
 class NetworkError(MusicError):
@@ -142,7 +162,7 @@ class QueueFull(MusicError):
     def __init__(self):
         super().__init__(f"播放隊列已滿（最大容量：{MAX_QUEUE_LENGTH}）")
 
-# === 輔助類別 ===
+# 輔助類別
 class DummyAudioSource(discord.AudioSource):
     """空白音頻源類別"""
     def read(self) -> bytes:
@@ -152,9 +172,9 @@ class DummyAudioSource(discord.AudioSource):
     def cleanup(self) -> None:
         pass
 
-# === 音頻源處理核心類別 ===
+# 音源處理
 class YTDLSource(discord.PCMVolumeTransformer):
-    """YouTube 音頻源處理器"""
+    """處理來自 yt-dlp 的音源，並轉換為 Discord 可播放格式"""
     
     _cache: Dict[str, Dict] = {}
     _cache_lock = asyncio.Lock()
@@ -164,7 +184,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
     
     def __init__(self, source: Optional[discord.AudioSource], *, data: Dict[str, Any],
                  volume: float = DEFAULT_VOLUME, lazy: bool = True, webpage_url: Optional[str] = None) -> None:
-        """初始化 YTDLSource 音頻源實例"""
+        """初始化音源實例"""
         if source is None:
             source = DummyAudioSource()
             
@@ -181,7 +201,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
     @classmethod
     async def clear_expired_cache(cls) -> None:
-        """非同步快取清理方法"""
+        """非同步清理過期的快取項目"""
         current_time = time.time()
         
         if (current_time - cls._last_cache_cleanup < CLEANUP_INTERVAL_SECONDS and
@@ -224,18 +244,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
     @classmethod
     async def from_url(cls, url: str, *, playlist_offset: int = 0) -> List['YTDLSource']:
-        """從 URL 或搜尋查詢中提取音頻源"""
-        # 驗證輸入
+        """從 URL 或搜尋查詢建立音源列表"""
         is_url = any(url.startswith(domain) for domain in VALID_DOMAINS)
         is_search_query = not url.startswith(('http://', 'https://'))
         
         if not is_url and not is_search_query:
             raise InvalidURL("❌ 請提供有效的 YouTube 連結或搜尋關鍵字")
             
-        # 非阻塞地清理過期緩存
         asyncio.create_task(cls.clear_expired_cache())
         
-        # 檢查緩存
         cache_key = f"{url}__{playlist_offset}"
         
         try:
@@ -250,7 +267,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
         except Exception as e:
             logger.warning(f"檢查緩存時發生錯誤: {e}")
 
-        # 重試機制
         retries = 2
         last_error = None
         
@@ -258,26 +274,29 @@ class YTDLSource(discord.PCMVolumeTransformer):
             try:
                 ydl_opts = YDL_OPTIONS.copy()
                 
-                # 設置播放清單的開始和結束位置
                 if playlist_offset:
                     ydl_opts['playliststart'] = playlist_offset + 1
                     ydl_opts['playlistend'] = playlist_offset + MAX_PLAYLIST_ITEMS
                 else:
                     ydl_opts['playlistend'] = MAX_PLAYLIST_ITEMS
 
-                ydl = youtube_dl.YoutubeDL(ydl_opts)
-                
+                # 在行程池中執行 yt-dlp
                 data = await asyncio.wait_for(
-                    asyncio.to_thread(ydl.extract_info, url, download=False),
+                    bot.loop.run_in_executor(
+                        process_executor,
+                        run_ytdlp_extraction,
+                        url,
+                        ydl_opts
+                    ),
                     timeout=YTDL_TIMEOUT
                 )
                 
-                if not data:
-                    raise InvalidURL(f"無法獲取音樂資訊: {url}")
+                if not data or data.get('_type') == 'error':
+                    error_info = data.get('error', '未知錯誤')
+                    raise InvalidURL(f"無法獲取音樂資訊: {url} ({error_info})")
                     
                 sources = cls._process_data(data, playlist_offset)
                 
-                # 緩存結果
                 if sources:
                     try:
                         async with cls._cache_lock:
@@ -300,7 +319,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 if attempt < retries:
                     await asyncio.sleep(1 * (attempt + 1))
         
-        # 所有重試都失敗
         error_msg = f"無法處理 URL: {url}"
         if isinstance(last_error, asyncio.TimeoutError):
             raise NetworkError(f"{error_msg} (網絡連接超時，請檢查網路並稍後再試)") from last_error
@@ -311,18 +329,16 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
     @classmethod
     def _process_data(cls, data: Dict, playlist_offset: int = 0) -> List['YTDLSource']:
-        """處理 YouTube-DL 返回的數據"""
+        """處理 yt-dlp 回傳的資料"""
         sources = []
         processed_count = 0
         skipped_count = 0
         
         try:
-            # 處理播放清單
             if 'entries' in data and data['entries']:
                 entries = data['entries']
                 original_count = len(entries)
                 
-                # 限制播放清單大小
                 if playlist_offset and len(entries) > MAX_PLAYLIST_ITEMS:
                     entries = entries[playlist_offset:playlist_offset+MAX_PLAYLIST_ITEMS]
                     logger.debug(f"播放清單已被切片: 從 {playlist_offset} 開始，限制為 {MAX_PLAYLIST_ITEMS} 項")
@@ -331,7 +347,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     if original_count > MAX_PLAYLIST_ITEMS:
                         logger.debug(f"播放清單被截斷: {original_count} -> {len(entries)} 項")
                 
-                # 處理每個播放清單項目
                 for entry in entries:
                     if not entry:
                         skipped_count += 1
@@ -345,23 +360,19 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         skipped_count += 1
                         continue
                     
-                    # 基本 metadata 預加載
                     partial_info = {
                         'title': entry.get('title', 'Unknown Track'),
                         'duration': entry.get('duration', 0),
                         'webpage_url': webpage_url
                     }
                     
-                    if 'uploader' in entry:
-                        partial_info['uploader'] = entry['uploader']
-                    if 'thumbnail' in entry:
-                        partial_info['thumbnail'] = entry['thumbnail']
+                    if 'uploader' in entry: partial_info['uploader'] = entry['uploader']
+                    if 'thumbnail' in entry: partial_info['thumbnail'] = entry['thumbnail']
                         
                     source = cls(None, data=partial_info, webpage_url=webpage_url)
                     sources.append(source)
                     processed_count += 1
             
-            # 處理單曲
             elif data.get('_type') != 'playlist':
                 webpage_url = data.get('webpage_url', '')
                 source = cls(None, data=data, webpage_url=webpage_url)
@@ -378,14 +389,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
     @classmethod
     def _create_audio_source(cls, data: Dict) -> Optional[discord.FFmpegPCMAudio]:
-        """創建音頻源"""
+        """建立 FFmpeg 音源"""
         url = data.get('url')
         if not url:
             raise InvalidURL("無法獲取音頻 URL")
         return create_ffmpeg_audio(url, start=0.0)
 
     async def prepare(self, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-        """準備音頻源"""
+        """準備音源以供播放 (獲取真實串流 URL)"""
         if not self.lazy or self._is_prepared:
             return
 
@@ -397,16 +408,21 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 ydl_opts = YDL_OPTIONS.copy()
                 ydl_opts.update({'playlistend': 1})
                 
-                ydl = youtube_dl.YoutubeDL(ydl_opts)
+                # 在行程池中執行 yt-dlp
                 partial_data = await asyncio.wait_for(
-                    asyncio.to_thread(ydl.extract_info, self.webpage_url, download=False),
+                    bot.loop.run_in_executor(
+                        process_executor,
+                        run_ytdlp_extraction,
+                        self.webpage_url,
+                        ydl_opts
+                    ),
                     timeout=YTDL_TIMEOUT
                 )
+
+                if not partial_data or partial_data.get('_type') == 'error':
+                    error_info = partial_data.get('error', '未知錯誤')
+                    raise MusicError(f"無法獲取音軌信息: {self.webpage_url} ({error_info})")
                 
-                if not partial_data:
-                    raise MusicError(f"無法獲取音軌信息: {self.webpage_url}")
-                
-                # 更新基本資訊
                 self.data.update({
                     'title': partial_data.get('title', self.data.get('title', 'Unknown Title')),
                     'duration': partial_data.get('duration', self.data.get('duration', 0)),
@@ -414,7 +430,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     'uploader': partial_data.get('uploader', self.data.get('uploader', ''))
                 })
                 
-                # 獲取音頻源
                 if partial_data.get('url'):
                     self.url = partial_data['url']
                     new_source = self._create_audio_source(partial_data)
@@ -425,23 +440,26 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     self._is_prepared = True
                     return
                 
-                # 獲取完整數據
                 ydl_opts['extract_flat'] = False
-                ydl = youtube_dl.YoutubeDL(ydl_opts)
+                # 在行程池中執行 yt-dlp
                 full_data = await asyncio.wait_for(
-                    asyncio.to_thread(ydl.extract_info, self.webpage_url, download=False),
+                    bot.loop.run_in_executor(
+                        process_executor,
+                        run_ytdlp_extraction,
+                        self.webpage_url,
+                        ydl_opts
+                    ),
                     timeout=YTDL_TIMEOUT
                 )
-                
-                if not full_data or not full_data.get('url'):
-                    raise MusicError(f"無法獲取音頻 URL: {self.webpage_url}")
-                
-                # 更新關鍵字段
+
+                if not full_data or not full_data.get('url') or full_data.get('_type') == 'error':
+                    error_info = full_data.get('error', '未知錯誤')
+                    raise MusicError(f"無法獲取音頻 URL: {self.webpage_url} ({error_info})")
+
                 self.url = full_data['url']
                 self.duration = full_data.get('duration', self.duration)
                 self.title = full_data.get('title', self.title)
                 
-                # 建立音頻源
                 new_source = self._create_audio_source(full_data)
                 if new_source:
                     self.original = new_source
@@ -459,7 +477,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
             if attempt < retries:
                 await asyncio.sleep(1.5 * (attempt + 1))
         
-        # 所有重試都失敗
         error_msg = f"無法加載音軌: {self.title}"
         if isinstance(last_error, asyncio.TimeoutError):
             raise NetworkError(f"{error_msg} (連接超時)") from last_error
@@ -471,9 +488,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
             self.original.cleanup()
         super().cleanup()
 
-# === 播放狀態管理系統 ===
+
+# 播放器狀態管理
 class GuildPlayer:
-    """伺服器專屬播放器"""
+    """管理單一伺服器的播放器狀態"""
     
     __slots__ = (
         'queue', 'volume', 'loop', 'loop_queue', 'now_playing',
@@ -519,7 +537,7 @@ class GuildPlayer:
             self._voice_client = None
 
 class MusicController:
-    """全域音樂控制器"""
+    """管理所有伺服器播放器的全域控制器"""
     
     def __init__(self) -> None:
         """初始化控制器"""
@@ -531,9 +549,27 @@ class MusicController:
 
 music = MusicController()
 
-# === 指令裝飾器與輔助函數 ===
+# 歌曲預加載
+async def _preload_track(track: YTDLSource, guild_id: int):
+    """在背景預加載音軌。預加載失敗是可接受的，播放時會再次嘗試。"""
+    try:
+        await track.prepare()
+        logger.info(f"✓ [預加載成功] Guild {guild_id}: {track.title}")
+    except Exception as e:
+        safe_log_error(guild_id, "preload_error", f"預加載失敗: {track.title} - {e}")
+
+def schedule_preload(player: GuildPlayer):
+    """為隊列中的下一首歌曲安排預加載任務。"""
+    if player.queue and player._voice_client and player._voice_client.is_connected():
+        next_track = player.queue[0]
+        if next_track.lazy and not next_track._is_prepared:
+            guild_id = player._voice_client.guild.id
+            logger.debug(f"正在為 Guild {guild_id} 調度預加載: {next_track.title}")
+            asyncio.create_task(_preload_track(next_track, guild_id))
+
+# 指令裝飾器與輔助函數
 def in_voice_channel() -> Callable:
-    """檢查使用者是否在語音頻道的裝飾器"""
+    """檢查指令使用者是否在語音頻道中"""
     async def predicate(ctx: commands.Context) -> bool:
         if not ctx.author.voice:
             await ctx.send("❌ 請先加入語音頻道後再使用此指令！")
@@ -542,7 +578,7 @@ def in_voice_channel() -> Callable:
     return commands.check(predicate)
 
 def ensure_player() -> Callable:
-    """確保播放器存在的裝飾器"""
+    """確保伺服器播放器實例存在"""
     async def predicate(ctx: commands.Context) -> bool:
         if not ctx.guild:
             await ctx.send("❌ 此指令僅能在伺服器中使用")
@@ -551,8 +587,8 @@ def ensure_player() -> Callable:
         return True
     return commands.check(predicate)
 
-async def safe_send(ctx: commands.Context, content: str, **kwargs) -> Optional[discord.Message]:
-    """安全的訊息發送函數"""
+async def safe_send(ctx: commands.Context, content: str = None, **kwargs) -> Optional[discord.Message]:
+    """安全地發送訊息，捕捉並記錄 HTTP 錯誤"""
     try:
         return await ctx.send(content, **kwargs)
     except discord.HTTPException as e:
@@ -560,7 +596,7 @@ async def safe_send(ctx: commands.Context, content: str, **kwargs) -> Optional[d
         return None
 
 def parse_playlist_offset(query: str) -> Tuple[str, int]:
-    """解析播放清單偏移參數"""
+    """從查詢字串中解析播放清單偏移量 (例如 '... -5')"""
     playlist_offset = 0
     
     offset_pattern = re.search(r'\s+\-(\d+)$', query)
@@ -574,7 +610,7 @@ def parse_playlist_offset(query: str) -> Tuple[str, int]:
     return query, playlist_offset
 
 def adjust_sources(sources: List[YTDLSource], current_queue_length: int) -> Tuple[List[YTDLSource], bool, int]:
-    """調整音頻源列表以符合隊列容量限制"""
+    """裁剪音源列表以符合隊列容量"""
     available_slots = MAX_QUEUE_LENGTH - current_queue_length
     was_truncated = False
     
@@ -585,7 +621,7 @@ def adjust_sources(sources: List[YTDLSource], current_queue_length: int) -> Tupl
     return sources, was_truncated, available_slots
 
 def create_ffmpeg_audio(url: str, start: float = 0.0) -> discord.FFmpegPCMAudio:
-    """建立 FFmpeg 音頻源"""
+    """建立 FFmpeg 音源實例"""
     
     before_options = '-thread_queue_size 8192'
     
@@ -612,7 +648,7 @@ def create_ffmpeg_audio(url: str, start: float = 0.0) -> discord.FFmpegPCMAudio:
         raise MusicError(error_msg) from e
 
 async def restart_audio(player: 'GuildPlayer', *, current_media_time: float) -> None:
-    """重新啟動音頻播放"""
+    """從指定時間點重新開始播放"""
     if not player.now_playing or not player.now_playing.url:
         logger.error("重啟播放失敗：無有效的播放音軌或 URL")
         return
@@ -645,7 +681,7 @@ async def restart_audio(player: 'GuildPlayer', *, current_media_time: float) -> 
         logger.error(f"音頻重啟失敗：{e}")
         
         if player.text_channel:
-            await safe_send(player.text_channel, f"⚠️ 播放重啟失敗：{e}")
+            await safe_send(player.text_channel, content=f"⚠️ 播放重啟失敗：{e}")
             
         try:
             if not player.voice_client.is_playing() and player.now_playing:
@@ -675,13 +711,13 @@ async def ensure_voice_connection(ctx: commands.Context, player: GuildPlayer) ->
         
         idle_checker.reset_timer(ctx.guild.id)
         
-        await safe_send(ctx, f"✅ 已加入語音頻道 **{user_channel}**")
+        await safe_send(ctx, content=f"✅ 已加入語音頻道 **{user_channel}**")
     
     return player
 
-# === 播放邏輯與事件處理系統 ===
+# 播放邏輯
 def setup_after(guild_id: int) -> Callable:
-    """設定播放完成後的回調函數"""
+    """建立一個執行緒安全的 'after' 回調函數"""
     def after_callback(error: Optional[Exception]) -> None:
         try:
             bot.loop.call_soon_threadsafe(
@@ -694,7 +730,7 @@ def setup_after(guild_id: int) -> Callable:
     return after_callback
 
 async def after_playing_callback(guild_id: int, error: Optional[Exception]) -> None:
-    """播放完成後的回調處理器"""
+    """處理音軌播放完畢或出錯後的邏輯"""
     player = music.get_player(guild_id)
     
     if not player._voice_client or not player._voice_client.is_connected():
@@ -716,7 +752,7 @@ async def after_playing_callback(guild_id: int, error: Optional[Exception]) -> N
                 logger.error(f"播放錯誤：{error_message}")
                 if player.text_channel:
                     truncated_error = error_message[:200] + "..." if len(error_message) > 200 else error_message
-                    await safe_send(player.text_channel, f"⚠️ 播放錯誤：{truncated_error}")
+                    await safe_send(player.text_channel, content=f"⚠️ 播放錯誤：{truncated_error}")
         
         if player.voice_client.is_playing():
             return
@@ -735,7 +771,7 @@ async def after_playing_callback(guild_id: int, error: Optional[Exception]) -> N
         safe_log_error(guild_id, "callback_error", f"播放回調處理異常：{e}")
         
         if player.text_channel:
-            await safe_send(player.text_channel, f"⚠️ 系統錯誤：{e}")
+            await safe_send(player.text_channel, content=f"⚠️ 系統錯誤：{e}")
         
         try:
             if player.queue and not player.voice_client.is_playing():
@@ -768,7 +804,7 @@ async def _replay_current(player: GuildPlayer) -> None:
     except Exception as e:
         safe_log_error(player.voice_client.guild.id, "replay_error", f"重播失敗：{e}")
         if player.text_channel:
-            await safe_send(player.text_channel, f"⚠️ 重播失敗：{e}")
+            await safe_send(player.text_channel, content=f"⚠️ 重播失敗：{e}")
 
 async def _play_next(guild_id: int, player: GuildPlayer) -> None:
     """播放隊列中的下一首歌曲"""
@@ -784,6 +820,7 @@ async def _play_next(guild_id: int, player: GuildPlayer) -> None:
             next_track = player.queue.popleft()
             
             try:
+                # 如果預加載失敗或尚未運行，這裡會同步等待加載
                 if next_track.lazy and not next_track._is_prepared:
                     await next_track.prepare()
                     
@@ -811,6 +848,10 @@ async def _play_next(guild_id: int, player: GuildPlayer) -> None:
                 idle_checker.reset_timer(guild_id)
                 
                 logger.debug(f"開始播放：{next_track.title}")
+
+                # 當前歌曲已開始播放，立即為下一首安排預加載
+                schedule_preload(player)
+                
                 return
                 
             except Exception as track_error:
@@ -820,7 +861,7 @@ async def _play_next(guild_id: int, player: GuildPlayer) -> None:
                     error_msg = f"⚠️ 跳過錯誤歌曲：{next_track.title}"
                     if len(str(track_error)) < 100:
                         error_msg += f" ({track_error})"
-                    await safe_send(player.text_channel, error_msg)
+                    await safe_send(player.text_channel, content=error_msg)
                 
                 continue
                 
@@ -829,7 +870,7 @@ async def _play_next(guild_id: int, player: GuildPlayer) -> None:
         player.media_offset = 0.0
         
         if player.text_channel:
-            await safe_send(player.text_channel, "✅ 播放完畢")
+            await safe_send(player.text_channel, content="✅ 播放完畢")
             
         logger.info(f"伺服器 {guild_id} 播放隊列已完成")
         
@@ -837,9 +878,9 @@ async def _play_next(guild_id: int, player: GuildPlayer) -> None:
         safe_log_error(guild_id, "play_next_error", f"播放下一首歌曲時發生異常：{e}")
         
         if player.text_channel:
-            await safe_send(player.text_channel, f"⚠️ 播放系統異常：{e}")
+            await safe_send(player.text_channel, content=f"⚠️ 播放系統異常：{e}")
 
-# === Discord 指令實作 ===
+# Discord 指令
 async def add_song_to_queue(ctx: commands.Context, player: GuildPlayer, sources: List[YTDLSource]) -> None:
     """將歌曲加入播放隊列"""
     try:
@@ -851,7 +892,7 @@ async def add_song_to_queue(ctx: commands.Context, player: GuildPlayer, sources:
             
     except Exception as e:
         logger.error(f"加入隊列時發生錯誤：{e}")
-        await safe_send(ctx, f"❌ 加入隊列失敗：{e}")
+        await safe_send(ctx, content=f"❌ 加入隊列失敗：{e}")
 
 @bot.command(name='join')
 @in_voice_channel()
@@ -863,7 +904,7 @@ async def join(ctx: commands.Context) -> None:
         
         if ctx.voice_client:
             if ctx.voice_client.channel == target_channel:
-                return await safe_send(ctx, "✅ 機器人已在當前語音頻道")
+                return await safe_send(ctx, content="✅ 機器人已在當前語音頻道")
             await ctx.voice_client.move_to(target_channel)
         else:
             player.voice_client = await target_channel.connect()
@@ -871,11 +912,11 @@ async def join(ctx: commands.Context) -> None:
         player.text_channel = ctx.channel
         idle_checker.reset_timer(ctx.guild.id)
         
-        await safe_send(ctx, f"✅ 已加入語音頻道 **{target_channel}**")
+        await safe_send(ctx, content=f"✅ 已加入語音頻道 **{target_channel}**")
         
     except Exception as e:
         safe_log_error(ctx.guild.id, "join_error", f"加入語音頻道失敗：{e}")
-        await safe_send(ctx, f"❌ 加入失敗：{e}")
+        await safe_send(ctx, content=f"❌ 加入失敗：{e}")
 
 async def _handle_playlist_addition(ctx: commands.Context, sources: List[YTDLSource], player: GuildPlayer) -> str:
     """處理播放清單加入的通用邏輯"""
@@ -911,20 +952,20 @@ async def play(ctx: commands.Context, *, query: str) -> None:
             sources = await YTDLSource.from_url(clean_query, playlist_offset=playlist_offset)
             
             if not sources:
-                return await safe_send(ctx, "❌ 未找到任何音樂內容")
+                return await safe_send(ctx, content="❌ 未找到任何音樂內容")
 
             response_message = await _handle_playlist_addition(ctx, sources, player)
-            await safe_send(ctx, response_message)
+            await safe_send(ctx, content=response_message)
         
         idle_checker.reset_timer(ctx.guild.id)
         
     except InvalidURL as e:
-        await safe_send(ctx, f"❌ 搜尋或 URL 錯誤：{e}")
+        await safe_send(ctx, content=f"❌ 搜尋或 URL 錯誤：{e}")
     except QueueFull as e:
-        await safe_send(ctx, f"❌ {e}")
+        await safe_send(ctx, content=f"❌ {e}")
     except Exception as e:
         safe_log_error(ctx.guild.id, "play_error", f"播放指令執行錯誤：{e}")
-        await safe_send(ctx, f"❌ 播放失敗：{e}")
+        await safe_send(ctx, content=f"❌ 播放失敗：{e}")
 
 def _build_play_response(sources: List[YTDLSource], player: GuildPlayer) -> str:
     """建立播放回應訊息"""
@@ -945,11 +986,11 @@ async def leave(ctx: commands.Context) -> None:
         
         idle_checker.cancel_timer(ctx.guild.id)
         
-        await safe_send(ctx, "👋 已離開語音頻道並清空播放隊列")
+        await safe_send(ctx, content="👋 已離開語音頻道並清空播放隊列")
         
     except Exception as e:
         safe_log_error(ctx.guild.id, "leave_error", f"離開語音頻道失敗：{e}")
-        await safe_send(ctx, f"❌ 離開失敗：{e}")
+        await safe_send(ctx, content=f"❌ 離開失敗：{e}")
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -989,18 +1030,20 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                         idle_checker.cancel_timer(guild_id)
                         
                         if text_channel:
-                            await safe_send(text_channel, "👋 所有用戶已離開語音頻道，機器人自動退出")
+                            await safe_send(text_channel, content="👋 所有用戶已離開語音頻道，機器人自動退出")
                     except Exception as e:
                         logger.error(f"機器人自動退出時發生錯誤: {e}")
 
-@bot.command(name='list')
-@ensure_player()
-async def list_queue(ctx: commands.Context, page: int = 1):
-    """顯示播放隊列"""
-    player = music.get_player(ctx.guild.id)
+# 播放隊列 Embed 輔助函數
+def _create_queue_embed(player: GuildPlayer, page: int) -> Tuple[Optional[discord.Embed], int]:
+    """建立播放隊列頁面的 Embed"""
     if not player.queue:
-        return await safe_send(ctx, "📪 播放隊列是空的")
-    
+        embed = discord.Embed(
+            description="📪 播放隊列是空的",
+            color=0xFFC7EA
+        )
+        return embed, 1
+
     total_pages = (len(player.queue) + QUEUE_PAGE_SIZE - 1) // QUEUE_PAGE_SIZE
     page = max(1, min(page, total_pages))
     start = (page - 1) * QUEUE_PAGE_SIZE
@@ -1008,16 +1051,77 @@ async def list_queue(ctx: commands.Context, page: int = 1):
     queue_slice = list(player.queue)[start:end]
 
     queue_list = []
-    for idx, item in enumerate(queue_slice, start=start+1):
-        duration = f"{int(item.duration // 60)}:{int(item.duration % 60):02d}" if item.duration else "未知時長"
-        queue_list.append(f"{idx}. **{item.title}** ({duration})")
+    for idx, item in enumerate(queue_slice, start=start + 1):
+        duration = f"{int(item.duration // 60)}:{int(item.duration % 60):02d}" if item.duration else "未知"
+        # 使用 Markdown 建立超連結
+        queue_list.append(f"`{idx}.` [**{item.title}**]({item.webpage_url}) `({duration})`")
 
     embed = discord.Embed(
-        title=f"播放隊列 (第 {page}/{total_pages} 頁)",
+        title=f"🎵 播放隊列 (第 {page}/{total_pages} 頁)",
         description="\n".join(queue_list) or "沒有內容",
         color=0xFFC7EA
     )
-    await ctx.send(embed=embed)
+    embed.set_footer(text=f"共 {len(player.queue)} 首歌曲")
+    return embed, total_pages
+
+
+# 播放隊列互動視圖
+class QueueView(ui.View):
+    """播放隊列的互動按鈕"""
+    def __init__(self, guild_id: int, current_page: int, total_pages: int):
+        super().__init__(timeout=BUTTON_TIMEOUT_SECONDS)
+        self.guild_id = guild_id
+        self.current_page = current_page
+        self.total_pages = total_pages
+        self.update_buttons()
+
+    def update_buttons(self):
+        """根據當前頁碼更新按鈕狀態"""
+        self.children[0].disabled = self.current_page <= 1
+        self.children[1].disabled = self.total_pages <= 1 or self.current_page >= self.total_pages
+
+    async def _update_message(self, interaction: discord.Interaction, new_page: int):
+        """處理分頁的訊息更新"""
+        player = music.get_player(self.guild_id)
+        if not player:
+            return await interaction.response.edit_message(content="播放器已失效。", embed=None, view=None)
+        
+        embed, new_total_pages = _create_queue_embed(player, new_page)
+        
+        self.current_page = max(1, min(new_page, new_total_pages))
+        self.total_pages = new_total_pages
+        
+        new_view = QueueView(self.guild_id, self.current_page, self.total_pages)
+        
+        await interaction.response.edit_message(embed=embed, view=new_view)
+
+    @ui.button(label="⬅️ 上一頁", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, button: ui.Button):
+        await self._update_message(interaction, self.current_page - 1)
+
+    @ui.button(label="➡️ 下一頁", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: ui.Button):
+        await self._update_message(interaction, self.current_page + 1)
+        
+    @ui.button(label="🔄 刷新", style=discord.ButtonStyle.primary)
+    async def refresh_queue(self, interaction: discord.Interaction, button: ui.Button):
+        await self._update_message(interaction, self.current_page)
+
+
+@bot.command(name='list')
+@ensure_player()
+async def list_queue(ctx: commands.Context, page: int = 1):
+    """顯示帶有互動按鈕的播放隊列"""
+    player = music.get_player(ctx.guild.id)
+    
+    embed, total_pages = _create_queue_embed(player, page)
+
+    if not player.queue:
+        return await safe_send(ctx, embed=embed)
+
+    view = QueueView(ctx.guild.id, page, total_pages)
+    await safe_send(ctx, embed=embed, view=view)
+
 
 @bot.command(name='now')
 @ensure_player()
@@ -1030,7 +1134,7 @@ async def display_now_playing_info(ctx_or_channel, player, embed_only=False):
     """顯示當前歌曲資訊"""
     if not player.now_playing:
         if not embed_only:
-            await safe_send(ctx_or_channel, "❌ 目前沒有正在播放的歌曲")
+            await safe_send(ctx_or_channel, content="❌ 目前沒有正在播放的歌曲")
         return None
         
     if player.start_time:
@@ -1090,9 +1194,9 @@ async def display_now_playing_info(ctx_or_channel, player, embed_only=False):
         controls = PlayerControlsView(player.voice_client.guild.id)
         
         try:
-            await ctx_or_channel.send(embed=embed, view=controls)
+            await ctx_or_channel.send(content=None, embed=embed, view=controls)
         except AttributeError:
-            await safe_send(ctx_or_channel, embed=embed, view=controls)
+            await safe_send(ctx_or_channel, content=None, embed=embed, view=controls)
         
         return embed
 
@@ -1191,21 +1295,21 @@ async def set_volume(ctx: commands.Context, volume: Optional[str] = None):
     """調整音量 (0 - 200) 或顯示當前音量"""
     player = music.get_player(ctx.guild.id)
     if volume is None:
-        return await safe_send(ctx, f"🔊 當前音量為 {int(player.volume * 100)}")
+        return await safe_send(ctx, content=f"🔊 當前音量為 {int(player.volume * 100)}")
     try:
         vol_value = float(volume)
     except ValueError:
-        return await safe_send(ctx, f"🔊 當前音量為 {int(player.volume * 100)}")
+        return await safe_send(ctx, content=f"🔊 當前音量為 {int(player.volume * 100)}")
 
     if not 0 <= vol_value <= 200:
-        return await safe_send(ctx, "❌ 音量必須在 0 到 200 之間")
+        return await safe_send(ctx, content="❌ 音量必須在 0 到 200 之間")
 
     player.volume = vol_value / 100.0
     if player.now_playing:
         player.now_playing.volume = player.volume
 
     idle_checker.reset_timer(ctx.guild.id)
-    await safe_send(ctx, f"🔊 音量已設定為 {int(vol_value)}")
+    await safe_send(ctx, content=f"🔊 音量已設定為 {int(vol_value)}")
 
 @bot.command(name='pause')
 @ensure_player()
@@ -1215,10 +1319,10 @@ async def toggle_pause(ctx: commands.Context):
     if player.voice_client.is_paused():
         player.voice_client.resume()
         idle_checker.reset_timer(ctx.guild.id)
-        await safe_send(ctx, "▶ 已恢復播放")
+        await safe_send(ctx, content="▶ 已恢復播放")
     else:
         player.voice_client.pause()
-        await safe_send(ctx, "⏸ 已暫停播放")
+        await safe_send(ctx, content="⏸ 已暫停播放")
 
 @bot.command(name='skip')
 @ensure_player()
@@ -1229,13 +1333,13 @@ async def skip(ctx: commands.Context, skip_count: str = "1"):
         if count < 1:
             raise ValueError
     except ValueError:
-        return await safe_send(ctx, "❌ 請輸入正確的數字")
+        return await safe_send(ctx, content="❌ 請輸入正確的數字")
 
     player = music.get_player(ctx.guild.id)
     if not player._voice_client or not player._voice_client.is_connected():
-        return await safe_send(ctx, "❌ 機器人目前未連接語音頻道")
+        return await safe_send(ctx, content="❌ 機器人目前未連接語音頻道")
     if not player.now_playing and not player.queue:
-        return await safe_send(ctx, "❌ 目前沒有正在播放的歌曲或隊列")
+        return await safe_send(ctx, content="❌ 目前沒有正在播放的歌曲或隊列")
 
     for _ in range(count - 1):
         if player.queue:
@@ -1249,7 +1353,7 @@ async def skip(ctx: commands.Context, skip_count: str = "1"):
         await _play_next(ctx.guild.id, player)
 
     idle_checker.reset_timer(ctx.guild.id)
-    await safe_send(ctx, f"⏭️ 已跳過 {count} 首歌曲")
+    await safe_send(ctx, content=f"⏭️ 已跳過 {count} 首歌曲")
 
 @bot.command(name='loop')
 @ensure_player()
@@ -1264,11 +1368,11 @@ async def toggle_loop(ctx: commands.Context, mode: Optional[str] = None):
         elif mode.lower() in ('off', 'disable', 'false'):
             player.loop = False
         else:
-            return await safe_send(ctx, "❌ 請使用 on 或 off 來設定單曲循環")
+            return await safe_send(ctx, content="❌ 請使用 on 或 off 來設定單曲循環")
     if player.loop:
-        await safe_send(ctx, "🔁 單曲循環已啟用")
+        await safe_send(ctx, content="🔁 單曲循環已啟用")
     else:
-        await safe_send(ctx, "⏹ 單曲循環已停用")
+        await safe_send(ctx, content="⏹ 單曲循環已停用")
 
 @bot.command(name='help')
 async def custom_help(ctx: commands.Context):
@@ -1319,27 +1423,29 @@ async def insert(ctx: commands.Context, *, query: str):
         async with ctx.typing():
             sources = await YTDLSource.from_url(query, playlist_offset=playlist_offset)
             if not sources:
-                return await safe_send(ctx, "❌ 未找到內容")
+                return await safe_send(ctx, content="❌ 未找到內容")
             sources, truncated, available = adjust_sources(sources, len(player.queue))
             for source in reversed(sources):
                 player.queue.appendleft(source)
 
             if not player.voice_client.is_playing():
                 await _play_next(ctx.guild.id, player)
+            else:
+                schedule_preload(player)
 
         idle_checker.reset_timer(ctx.guild.id)
 
         response = f"✅ 已插入 {len(sources)} 首曲目到隊列的下一首"
         if truncated:
             response += f"\n⚠️ 播放清單超過允許數量，僅加入 {available} 首歌曲"
-        await safe_send(ctx, response)
+        await safe_send(ctx, content=response)
     except InvalidURL as e:
-        await safe_send(ctx, f"❌ 無效的 URL: {e}")
+        await safe_send(ctx, content=f"❌ 無效的 URL: {e}")
     except QueueFull as e:
-        await safe_send(ctx, f"❌ {e}")
+        await safe_send(ctx, content=f"❌ {e}")
     except Exception as e:
         logger.error(f"插入命令錯誤: {e}")
-        await safe_send(ctx, f"❌ 插入失敗: {e}")
+        await safe_send(ctx, content=f"❌ 插入失敗: {e}")
 
 @bot.command(name='del')
 @ensure_player()
@@ -1348,25 +1454,28 @@ async def delete_song(ctx: commands.Context, index: str):
     try:
         player = music.get_player(ctx.guild.id)
         if not player.queue:
-            return await safe_send(ctx, "📪 播放隊列是空的")
+            return await safe_send(ctx, content="📪 播放隊列是空的")
         try:
             idx = int(index)
         except ValueError:
-            return await safe_send(ctx, "❌ 請輸入有效的序列號")
+            return await safe_send(ctx, content="❌ 請輸入有效的序列號")
         if idx < 1:
-            return await safe_send(ctx, "❌ 序列號必須大於 0")
+            return await safe_send(ctx, content="❌ 序列號必須大於 0")
         
         lst = list(player.queue)
         if idx > len(lst):
-            return await safe_send(ctx, f"❌ 序列號超出範圍 (當前隊列長度: {len(lst)})")
+            return await safe_send(ctx, content=f"❌ 序列號超出範圍 (當前隊列長度: {len(lst)})")
         
         song = lst.pop(idx - 1)
         player.queue = deque(lst, maxlen=MAX_QUEUE_LENGTH)
         
-        await safe_send(ctx, f"✅ 已刪除 **{song.title}** 從播放隊列")
+        if idx == 1 and player._voice_client and player._voice_client.is_playing():
+            schedule_preload(player)
+            
+        await safe_send(ctx, content=f"✅ 已刪除 **{song.title}** 從播放隊列")
     except Exception as e:
         logger.error(f"刪除命令錯誤: {e}", exc_info=True)
-        await safe_send(ctx, f"❌ 刪除失敗: {e}")
+        await safe_send(ctx, content=f"❌ 刪除失敗: {e}")
 
 @bot.command(name='clean')
 @ensure_player()
@@ -1375,10 +1484,10 @@ async def clean_queue(ctx: commands.Context):
     try:
         player = music.get_player(ctx.guild.id)
         player.queue.clear()
-        await safe_send(ctx, "🧹 已清空播放隊列")
+        await safe_send(ctx, content="🧹 已清空播放隊列")
     except Exception as e:
         logger.error(f"清空隊列失敗: {e}")
-        await safe_send(ctx, f"❌ 清空失敗: {e}")
+        await safe_send(ctx, content=f"❌ 清空失敗: {e}")
 
 @bot.command(name='move')
 @ensure_player()
@@ -1387,34 +1496,37 @@ async def move_song(ctx: commands.Context, from_index: str, to_index: str):
     try:
         player = music.get_player(ctx.guild.id)
         if not player.queue:
-            return await safe_send(ctx, "📪 播放隊列是空的")
+            return await safe_send(ctx, content="📪 播放隊列是空的")
         
         try:
             from_idx = int(from_index)
             to_idx = int(to_index)
         except ValueError:
-            return await safe_send(ctx, "❌ 請輸入有效的序列號")
+            return await safe_send(ctx, content="❌ 請輸入有效的序列號")
         
         if from_idx < 1 or to_idx < 1:
-            return await safe_send(ctx, "❌ 序列號必須大於 0")
+            return await safe_send(ctx, content="❌ 序列號必須大於 0")
         
         lst = list(player.queue)
         if from_idx > len(lst) or to_idx > len(lst):
-            return await safe_send(ctx, f"❌ 序列號超出範圍 (當前隊列長度: {len(lst)})")
+            return await safe_send(ctx, content=f"❌ 序列號超出範圍 (當前隊列長度: {len(lst)})")
         
         song = lst.pop(from_idx - 1)
         lst.insert(to_idx - 1, song)
         
         player.queue = deque(lst, maxlen=MAX_QUEUE_LENGTH)
         
-        await safe_send(ctx, f"✅ 已將 **{song.title}** 從位置 {from_idx} 移動到位置 {to_idx}")
+        if (from_idx == 1 or to_idx == 1) and player._voice_client and player._voice_client.is_playing():
+            schedule_preload(player)
+
+        await safe_send(ctx, content=f"✅ 已將 **{song.title}** 從位置 {from_idx} 移動到位置 {to_idx}")
     except Exception as e:
         logger.error(f"移動命令錯誤: {e}")
-        await safe_send(ctx, f"❌ 移動失敗: {e}")
+        await safe_send(ctx, content=f"❌ 移動失敗: {e}")
 
-# === 閒置檢測 ===
+# 閒置檢測
 class IdleChecker:
-    """管理語音頻道閒置狀態檢測"""
+    """管理語音頻道的閒置檢測器"""
     def __init__(self):
         self.idle_timers = {}
         self.IDLE_TIMEOUT = IDLE_TIMEOUT_SECONDS
@@ -1425,7 +1537,7 @@ class IdleChecker:
         return music.get_player(guild_id)
     
     async def _idle_check_task(self, guild_id):
-        """非同步任務：檢查閒置狀態"""
+        """檢查閒置狀態的背景任務"""
         guild_ref = weakref.ref(bot.get_guild(guild_id))
         
         try:
@@ -1452,7 +1564,7 @@ class IdleChecker:
                             await player._voice_client.disconnect()
                         player.cleanup()
                         if text_channel:
-                            await safe_send(text_channel, f"⏰ 已閒置 {int(idle_duration)} 秒，自動離開語音頻道")
+                            await safe_send(text_channel, content=f"⏰ 已閒置 {int(idle_duration)} 秒，自動離開語音頻道")
                     except Exception as e:
                         safe_log_error(guild_id, "idle_timeout", f"閒置超時處理出錯: {e}")
                     
@@ -1465,7 +1577,7 @@ class IdleChecker:
             self.idle_timers.pop(guild_id, None)
     
     def reset_timer(self, guild_id):
-        """重置活動計時器"""
+        """重置指定伺服器的閒置計時器"""
         if guild_id in self.idle_timers:
             self.idle_timers[guild_id]['last_activity'] = datetime.datetime.now()
         else:
@@ -1475,7 +1587,7 @@ class IdleChecker:
             }
     
     def cancel_timer(self, guild_id):
-        """取消指定伺服器的計時器"""
+        """取消指定伺服器的閒置計時器"""
         if guild_id in self.idle_timers:
             if 'task' in self.idle_timers[guild_id]:
                 self.idle_timers[guild_id]['task'].cancel()
@@ -1483,10 +1595,10 @@ class IdleChecker:
 
 idle_checker = IdleChecker()
 
-# === 錯誤處理 ===
+# 錯誤處理
 @bot.event
 async def on_command_error(ctx, error):
-    """全域錯誤處理器"""
+    """全域指令錯誤處理器"""
     error = getattr(error, 'original', error)
     
     custom_messages = {
@@ -1502,23 +1614,31 @@ async def on_command_error(ctx, error):
         if str(error) == "用戶未在語音頻道":
             return
         else:
-            return await safe_send(ctx, "❌ 權限不足或條件不符")
+            return await safe_send(ctx, content="❌ 權限不足或條件不符")
     
     for error_type, message in custom_messages.items():
         if isinstance(error, error_type):
-            return await safe_send(ctx, message)
+            return await safe_send(ctx, content=message)
     
     if isinstance(error, MusicError):
-        return await safe_send(ctx, f"🎵 音樂錯誤: {error}")
+        return await safe_send(ctx, content=f"🎵 音樂錯誤: {error}")
     
     guild_id = ctx.guild.id if ctx.guild else 0
     safe_log_error(guild_id, "unhandled_error", f"未處理的錯誤: {type(error)} - {str(error)}")
-    await safe_send(ctx, f"⚠️ 發生未預期錯誤: {str(error)}")
+    await safe_send(ctx, content=f"⚠️ 發生未預期錯誤: {str(error)}")
 
-# === 運行機器人 ===
+# 啟動點
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     token = os.getenv('DISCORD_BOT_TOKEN')
     if not token:
         raise ValueError("未找到 DISCORD_BOT_TOKEN 環境變量")
-    bot.run(token)
+    
+    try:
+        bot.run(token, log_level=logging.INFO) # 透過 run 方法設定日誌級別
+    except KeyboardInterrupt:
+        logging.info("收到關閉信號...")
+    finally:
+        # 優雅地關閉行程池
+        logging.info("正在關閉 ProcessPoolExecutor...")
+        process_executor.shutdown(wait=True)
+        logging.info("Executor 已關閉。")
