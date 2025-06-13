@@ -1136,69 +1136,76 @@ async def display_now_playing_info(ctx_or_channel, player, embed_only=False):
         if not embed_only:
             await safe_send(ctx_or_channel, content="❌ 目前沒有正在播放的歌曲")
         return None
-        
-    if player.start_time:
+    
+    if player.voice_client.is_paused():
+        current_media_time = player.media_offset
+    elif player.start_time:
         elapsed = time.time() - player.start_time
         current_media_time = player.media_offset + elapsed
-        
-        duration = player.now_playing.duration or 0
-        progress_bar = _build_progress_bar(int(current_media_time), int(duration))
-        
-        song_data = player.now_playing.data or {}
-        uploader = song_data.get('uploader', '未知上傳者')
-        upload_date = song_data.get('upload_date', '未知')
-        
-        if upload_date and upload_date != '未知' and len(upload_date) == 8:
-            try:
-                year, month, day = upload_date[:4], upload_date[4:6], upload_date[6:8]
-                upload_date = f"{year}-{month}-{day}"
-            except:
-                pass
-                
-        status_text = "暫停中" if player.voice_client.is_paused() else "正在播放"
-        embed_color = 0xAAAAAA if player.voice_client.is_paused() else 0xFFC7EA
+    else:
+        current_media_time = player.media_offset
+
+    duration = player.now_playing.duration or 0
+    if duration > 0:
+        current_media_time = min(current_media_time, duration)
+    
+    progress_bar = _build_progress_bar(int(current_media_time), int(duration))
+    
+    song_data = player.now_playing.data or {}
+    uploader = song_data.get('uploader', '未知上傳者')
+    upload_date = song_data.get('upload_date', '未知')
+    
+    if upload_date and upload_date != '未知' and len(upload_date) == 8:
+        try:
+            year, month, day = upload_date[:4], upload_date[4:6], upload_date[6:8]
+            upload_date = f"{year}-{month}-{day}"
+        except:
+            pass
             
-        embed = discord.Embed(
-            title=f"🎵 {status_text}",
-            description=f"### [{player.now_playing.title}]({player.now_playing.webpage_url})",
-            color=embed_color
-        )
+    status_text = "暫停中" if player.voice_client.is_paused() else "正在播放"
+    embed_color = 0xAAAAAA if player.voice_client.is_paused() else 0xFFC7EA
+            
+    embed = discord.Embed(
+        title=f"🎵 {status_text}",
+        description=f"### [{player.now_playing.title}]({player.now_playing.webpage_url})",
+        color=embed_color
+    )
         
-        if player.now_playing.data.get('thumbnail', ''):
-            embed.set_thumbnail(url=player.now_playing.data.get('thumbnail', ''))
+    if player.now_playing.data.get('thumbnail', ''):
+        embed.set_thumbnail(url=player.now_playing.data.get('thumbnail', ''))
         
-        embed.add_field(name="👤 上傳者", value=f"```{uploader}```", inline=True)
-        if upload_date != '未知':
-            embed.add_field(name="📅 上傳日期", value=f"```{upload_date}```", inline=True)
-        embed.add_field(name="🔊 音量", value=f"```{int(player.volume * 100)}%```", inline=True)
+    embed.add_field(name="👤 上傳者", value=f"```{uploader}```", inline=True)
+    if upload_date != '未知':
+        embed.add_field(name="📅 上傳日期", value=f"```{upload_date}```", inline=True)
+    embed.add_field(name="🔊 音量", value=f"```{int(player.volume * 100)}%```", inline=True)
         
+    embed.add_field(
+        name=f"⏱️ 播放進度",
+        value=f"`{_format_time(current_media_time)} / {_format_time(duration)}`\n{progress_bar}",
+        inline=False
+    )
+        
+    if player.queue:
+        next_song = player.queue[0]
         embed.add_field(
-            name=f"⏱️ 播放進度",
-            value=f"`{_format_time(current_media_time)} / {_format_time(duration)}`\n{progress_bar}",
+            name="🎵 下一首",
+            value=f"```{next_song.title}```\n隊列中還有 {len(player.queue)} 首歌曲",
             inline=False
         )
+    else:
+        embed.add_field(name="📋 隊列信息", value="隊列中還有 0 首歌曲", inline=False)
         
-        if player.queue:
-            next_song = player.queue[0]
-            embed.add_field(
-                name="🎵 下一首",
-                value=f"```{next_song.title}```\n隊列中還有 {len(player.queue)} 首歌曲",
-                inline=False
-            )
-        else:
-            embed.add_field(name="📋 隊列信息", value="隊列中還有 0 首歌曲", inline=False)
-        
-        if embed_only:
-            return embed
-        
-        controls = PlayerControlsView(player.voice_client.guild.id)
-        
-        try:
-            await ctx_or_channel.send(content=None, embed=embed, view=controls)
-        except AttributeError:
-            await safe_send(ctx_or_channel, content=None, embed=embed, view=controls)
-        
+    if embed_only:
         return embed
+        
+    controls = PlayerControlsView(player.voice_client.guild.id)
+        
+    try:
+        await ctx_or_channel.send(content=None, embed=embed, view=controls)
+    except AttributeError:
+        await safe_send(ctx_or_channel, content=None, embed=embed, view=controls)
+        
+    return embed
 
 class PlayerControlsView(ui.View):
     """播放控制按鈕"""
@@ -1209,15 +1216,23 @@ class PlayerControlsView(ui.View):
     @ui.button(label="⏯️ 暫停/播放", style=discord.ButtonStyle.primary)
     async def toggle_playback(self, interaction: discord.Interaction, button: ui.Button):
         player = music.get_player(self.guild_id)
-        if not player._voice_client or not player._voice_client.is_connected():
-            return await interaction.response.send_message("❌ 機器人未連接語音頻道", ephemeral=True)
+        if not player._voice_client or not player._voice_client.is_connected() or not player.now_playing:
+            return await interaction.response.send_message("❌ 機器人未連接語音頻道或沒有歌曲播放", ephemeral=True)
         
         if player.voice_client.is_paused():
             player.voice_client.resume()
+            # 恢復計時
+            if player.start_time is None:
+                player.start_time = time.time()
             idle_checker.reset_timer(self.guild_id)
             await interaction.response.send_message("▶ 已恢復播放", ephemeral=True)
         else:
             player.voice_client.pause()
+            # 暫停計時並更新 offset
+            if player.start_time is not None:
+                elapsed_since_start = time.time() - player.start_time
+                player.media_offset += elapsed_since_start
+                player.start_time = None # 標記為暫停
             await interaction.response.send_message("⏸ 已暫停播放", ephemeral=True)
             
     @ui.button(label="⏭️ 跳過", style=discord.ButtonStyle.primary)
@@ -1316,12 +1331,23 @@ async def set_volume(ctx: commands.Context, volume: Optional[str] = None):
 async def toggle_pause(ctx: commands.Context):
     """暫停/恢復播放"""
     player = music.get_player(ctx.guild.id)
+    if not player._voice_client or not player.now_playing:
+        return await safe_send(ctx, content="❌ 目前沒有正在播放的歌曲")
+
     if player.voice_client.is_paused():
         player.voice_client.resume()
+        # 恢復計時
+        if player.start_time is None:
+            player.start_time = time.time()
         idle_checker.reset_timer(ctx.guild.id)
         await safe_send(ctx, content="▶ 已恢復播放")
     else:
         player.voice_client.pause()
+        # 暫停計時並更新 offset
+        if player.start_time is not None:
+            elapsed_since_start = time.time() - player.start_time
+            player.media_offset += elapsed_since_start
+            player.start_time = None  # 標記為暫停
         await safe_send(ctx, content="⏸ 已暫停播放")
 
 @bot.command(name='skip')
