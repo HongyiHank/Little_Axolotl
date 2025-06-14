@@ -179,8 +179,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
     _cache: Dict[str, Dict] = {}
     _cache_lock = asyncio.Lock()
     _last_cache_cleanup = 0
-    
-    __slots__ = ('original', 'data', 'title', 'duration', 'url', 'lazy', 'webpage_url', '_is_prepared')
+    __slots__ = ('original', 'data', 'title', 'duration', 'url', 'lazy', 
+                 'webpage_url', '_is_prepared', '_prepare_lock')
     
     def __init__(self, source: Optional[discord.AudioSource], *, data: Dict[str, Any],
                  volume: float = DEFAULT_VOLUME, lazy: bool = True, webpage_url: Optional[str] = None) -> None:
@@ -198,6 +198,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.lazy = lazy
         self.webpage_url = webpage_url or data.get('webpage_url')
         self._is_prepared = not lazy
+        self._prepare_lock = asyncio.Lock()
 
     @classmethod
     async def clear_expired_cache(cls) -> None:
@@ -396,91 +397,96 @@ class YTDLSource(discord.PCMVolumeTransformer):
         return create_ffmpeg_audio(url, start=0.0)
 
     async def prepare(self, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-        """準備音源以供播放 (獲取真實串流 URL)"""
+        """
+        準備音源以供播放 (獲取真實串流 URL)。
+        """
         if not self.lazy or self._is_prepared:
             return
+        async with self._prepare_lock:
+            if self._is_prepared:
+                return
 
-        retries = 2
-        last_error = None
-        
-        for attempt in range(retries + 1):
-            try:
-                ydl_opts = YDL_OPTIONS.copy()
-                ydl_opts.update({'playlistend': 1})
-                
-                # 在行程池中執行 yt-dlp
-                partial_data = await asyncio.wait_for(
-                    bot.loop.run_in_executor(
-                        process_executor,
-                        run_ytdlp_extraction,
-                        self.webpage_url,
-                        ydl_opts
-                    ),
-                    timeout=YTDL_TIMEOUT
-                )
+            retries = 2
+            last_error = None
+            
+            for attempt in range(retries + 1):
+                try:
+                    ydl_opts = YDL_OPTIONS.copy()
+                    ydl_opts.update({'playlistend': 1})
+                    
+                    # 在行程池中執行 yt-dlp
+                    partial_data = await asyncio.wait_for(
+                        bot.loop.run_in_executor(
+                            process_executor,
+                            run_ytdlp_extraction,
+                            self.webpage_url,
+                            ydl_opts
+                        ),
+                        timeout=YTDL_TIMEOUT
+                    )
 
-                if not partial_data or partial_data.get('_type') == 'error':
-                    error_info = partial_data.get('error', '未知錯誤')
-                    raise MusicError(f"無法獲取音軌信息: {self.webpage_url} ({error_info})")
-                
-                self.data.update({
-                    'title': partial_data.get('title', self.data.get('title', 'Unknown Title')),
-                    'duration': partial_data.get('duration', self.data.get('duration', 0)),
-                    'thumbnail': partial_data.get('thumbnail', self.data.get('thumbnail', '')),
-                    'uploader': partial_data.get('uploader', self.data.get('uploader', ''))
-                })
-                
-                if partial_data.get('url'):
-                    self.url = partial_data['url']
-                    new_source = self._create_audio_source(partial_data)
+                    if not partial_data or partial_data.get('_type') == 'error':
+                        error_info = partial_data.get('error', '未知錯誤')
+                        raise MusicError(f"無法獲取音軌信息: {self.webpage_url} ({error_info})")
+                    
+                    self.data.update({
+                        'title': partial_data.get('title', self.data.get('title', 'Unknown Title')),
+                        'duration': partial_data.get('duration', self.data.get('duration', 0)),
+                        'thumbnail': partial_data.get('thumbnail', self.data.get('thumbnail', '')),
+                        'uploader': partial_data.get('uploader', self.data.get('uploader', ''))
+                    })
+                    
+                    if partial_data.get('url'):
+                        self.url = partial_data['url']
+                        new_source = self._create_audio_source(partial_data)
+                        if new_source:
+                            self.original = new_source
+                            self.source = new_source
+                        self.data.update(partial_data)
+                        self._is_prepared = True
+                        return
+                    
+                    ydl_opts['extract_flat'] = False
+                    # 在行程池中執行 yt-dlp
+                    full_data = await asyncio.wait_for(
+                        bot.loop.run_in_executor(
+                            process_executor,
+                            run_ytdlp_extraction,
+                            self.webpage_url,
+                            ydl_opts
+                        ),
+                        timeout=YTDL_TIMEOUT
+                    )
+
+                    if not full_data or not full_data.get('url') or full_data.get('_type') == 'error':
+                        error_info = full_data.get('error', '未知錯誤')
+                        raise MusicError(f"無法獲取音頻 URL: {self.webpage_url} ({error_info})")
+
+                    self.url = full_data['url']
+                    self.duration = full_data.get('duration', self.duration)
+                    self.title = full_data.get('title', self.title)
+                    
+                    new_source = self._create_audio_source(full_data)
                     if new_source:
                         self.original = new_source
                         self.source = new_source
-                    self.data.update(partial_data)
+                        
+                    self.data.update(full_data)
                     self._is_prepared = True
                     return
-                
-                ydl_opts['extract_flat'] = False
-                # 在行程池中執行 yt-dlp
-                full_data = await asyncio.wait_for(
-                    bot.loop.run_in_executor(
-                        process_executor,
-                        run_ytdlp_extraction,
-                        self.webpage_url,
-                        ydl_opts
-                    ),
-                    timeout=YTDL_TIMEOUT
-                )
-
-                if not full_data or not full_data.get('url') or full_data.get('_type') == 'error':
-                    error_info = full_data.get('error', '未知錯誤')
-                    raise MusicError(f"無法獲取音頻 URL: {self.webpage_url} ({error_info})")
-
-                self.url = full_data['url']
-                self.duration = full_data.get('duration', self.duration)
-                self.title = full_data.get('title', self.title)
-                
-                new_source = self._create_audio_source(full_data)
-                if new_source:
-                    self.original = new_source
-                    self.source = new_source
                     
-                self.data.update(full_data)
-                self._is_prepared = True
-                return
-                
-            except asyncio.TimeoutError as e:
-                last_error = e
-            except Exception as e:
-                last_error = e
-                
-            if attempt < retries:
-                await asyncio.sleep(1.5 * (attempt + 1))
-        
-        error_msg = f"無法加載音軌: {self.title}"
-        if isinstance(last_error, asyncio.TimeoutError):
-            raise NetworkError(f"{error_msg} (連接超時)") from last_error
-        raise MusicError(error_msg) from last_error
+                except asyncio.TimeoutError as e:
+                    last_error = e
+                except Exception as e:
+                    last_error = e
+                    
+                if attempt < retries:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            
+            error_msg = f"無法加載音軌: {self.title}"
+            if isinstance(last_error, asyncio.TimeoutError):
+                raise NetworkError(f"{error_msg} (連接超時)") from last_error
+            raise MusicError(error_msg) from last_error
 
     def cleanup(self) -> None:
         """清理資源"""
@@ -782,14 +788,10 @@ async def after_playing_callback(guild_id: int, error: Optional[Exception]) -> N
 async def _replay_current(player: GuildPlayer) -> None:
     """重播當前歌曲"""
     try:
-        if player.now_playing.lazy and not player.now_playing._is_prepared:
-            await player.now_playing.prepare()
-            
+        await player.now_playing.prepare()
         new_audio_source = create_ffmpeg_audio(player.now_playing.url, start=0.0)
-        
-        player.now_playing.original = new_audio_source
-        player.now_playing.source = new_audio_source
-        
+        replayed_source = YTDLSource(new_audio_source, data=player.now_playing.data, volume=player.volume, lazy=False)
+        player.now_playing = replayed_source
         guild_id = player.voice_client.guild.id
         player.voice_client.play(
             player.now_playing,
@@ -805,6 +807,7 @@ async def _replay_current(player: GuildPlayer) -> None:
         safe_log_error(player.voice_client.guild.id, "replay_error", f"重播失敗：{e}")
         if player.text_channel:
             await safe_send(player.text_channel, content=f"⚠️ 重播失敗：{e}")
+            await _play_next(player.voice_client.guild.id, player)
 
 async def _play_next(guild_id: int, player: GuildPlayer) -> None:
     """播放隊列中的下一首歌曲"""
@@ -821,8 +824,7 @@ async def _play_next(guild_id: int, player: GuildPlayer) -> None:
             
             try:
                 # 如果預加載失敗或尚未運行，這裡會同步等待加載
-                if next_track.lazy and not next_track._is_prepared:
-                    await next_track.prepare()
+                await next_track.prepare()
                     
                 if not next_track.url:
                     raise InvalidURL("音頻源 URL 無效或已過期")
@@ -929,8 +931,12 @@ async def _handle_playlist_addition(ctx: commands.Context, sources: List[YTDLSou
     if was_truncated:
         response += f"\n⚠️ 播放清單超過容量限制，僅加入前 {available_slots} 首歌曲"
     
-    if not player.voice_client.is_playing():
+    if not player.voice_client.is_playing() and not player.voice_client.is_paused():
         await _play_next(ctx.guild.id, player)
+    else:
+        # 如果正在播放，且隊列剛從空變成有，則預加載第一首
+        if len(player.queue) == len(adjusted_sources):
+            schedule_preload(player)
     
     return response
 
@@ -1201,11 +1207,12 @@ async def display_now_playing_info(ctx_or_channel, player, embed_only=False):
     controls = PlayerControlsView(player.voice_client.guild.id)
         
     try:
-        await ctx_or_channel.send(content=None, embed=embed, view=controls)
-    except AttributeError:
-        await safe_send(ctx_or_channel, content=None, embed=embed, view=controls)
-        
-    return embed
+        if isinstance(ctx_or_channel, (discord.TextChannel, discord.VoiceChannel, discord.Thread, commands.Context)):
+            await ctx_or_channel.send(content=None, embed=embed, view=controls)
+        else:
+            logger.warning("display_now_playing_info 收到無效的 ctx_or_channel 類型")
+    except Exception as e:
+        safe_log_error(player.voice_client.guild.id, "now_playing_send", f"發送 'Now Playing' 訊息失敗: {e}")
 
 class PlayerControlsView(ui.View):
     """播放控制按鈕"""
@@ -1244,9 +1251,9 @@ class PlayerControlsView(ui.View):
         if not player.now_playing and not player.queue:
             return await interaction.response.send_message("❌ 目前沒有正在播放的歌曲或隊列", ephemeral=True)
             
-        if player.voice_client.is_playing():
+        if player.voice_client.is_playing() or player.voice_client.is_paused():
             player.voice_client.stop()
-        else:
+        else: # 如果因為某種原因停止了但隊列仍在
             await _play_next(self.guild_id, player)
             
         idle_checker.reset_timer(self.guild_id)
@@ -1373,7 +1380,7 @@ async def skip(ctx: commands.Context, skip_count: str = "1"):
         else:
             break
 
-    if player.voice_client.is_playing():
+    if player.voice_client.is_playing() or player.voice_client.is_paused():
         player.voice_client.stop()
     else:
         await _play_next(ctx.guild.id, player)
@@ -1454,7 +1461,7 @@ async def insert(ctx: commands.Context, *, query: str):
             for source in reversed(sources):
                 player.queue.appendleft(source)
 
-            if not player.voice_client.is_playing():
+            if not player.voice_client.is_playing() and not player.voice_client.is_paused():
                 await _play_next(ctx.guild.id, player)
             else:
                 schedule_preload(player)
@@ -1576,6 +1583,11 @@ class IdleChecker:
                 if not guild or not player or not player._voice_client:
                     break
                 
+                # 如果正在播放，不計為閒置
+                if player._voice_client.is_playing():
+                    self.reset_timer(guild_id)
+                    continue
+
                 last_activity_time = self.idle_timers.get(guild_id, {}).get('last_activity', datetime.datetime.now())
                 
                 idle_duration = (datetime.datetime.now() - last_activity_time).total_seconds()
@@ -1660,7 +1672,7 @@ if __name__ == "__main__":
         raise ValueError("未找到 DISCORD_BOT_TOKEN 環境變量")
     
     try:
-        bot.run(token, log_level=logging.INFO) # 透過 run 方法設定日誌級別
+        bot.run(token, log_level=logging.INFO)
     except KeyboardInterrupt:
         logging.info("收到關閉信號...")
     finally:
