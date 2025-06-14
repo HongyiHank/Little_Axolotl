@@ -58,7 +58,7 @@ VALID_DOMAINS = tuple(get_env_value('VALID_DOMAINS', [
 
 # yt-dlp 核心配置
 YDL_OPTIONS = {
-    'format': os.getenv('YTDL_FORMAT', '251'),
+    'format': os.getenv('YTDL_FORMAT', 'bestaudio/best'),
     'nocheckcertificate': get_env_value('YTDL_NO_CHECK_CERTIFICATE', True, bool),
     'ignoreerrors': get_env_value('YTDL_IGNORE_ERRORS', True, bool),
     'quiet': get_env_value('YTDL_QUIET', True, bool),
@@ -1632,6 +1632,27 @@ class IdleChecker:
             self.idle_timers.pop(guild_id, None)
 
 idle_checker = IdleChecker()
+
+@bot.event
+async def on_ready():
+    print(f'✓ {bot.user} 已成功登入並準備就緒！')
+    
+    active_voice_clients = list(bot.voice_clients)
+    
+    if active_voice_clients:
+        logger.warning(f"偵測到 {len(active_voice_clients)} 個殘留的語音連接，正在強制斷開...")
+        for vc in active_voice_clients:
+            try:
+                if vc.guild.id in music.players:
+                    music.players[vc.guild.id].cleanup()
+                    del music.players[vc.guild.id]
+                    idle_checker.cancel_timer(vc.guild.id)
+                
+                await vc.disconnect(force=True)
+            except Exception as e:
+                logger.error(f"在清理伺服器 {vc.guild.name} 的殘留連接時發生錯誤: {e}")
+    
+    music.players.clear()
 
 # 錯誤處理
 @bot.event
