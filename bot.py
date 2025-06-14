@@ -85,24 +85,24 @@ bot = commands.Bot(
     case_insensitive=CASE_INSENSITIVE
 )
 
-# 為 yt-dlp 建立行程池，避免阻塞主事件循環
-process_executor = concurrent.futures.ProcessPoolExecutor(max_workers=2)
+# 為 yt-dlp 建立執行緒池，避免阻塞主事件循環
+# max_workers 可根據伺服器 CPU 邏輯核心數調整，建議 4~8，通常不超過 CPU 邏輯核心數
+thread_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
 
 logger = logging.getLogger('discord.music_bot')
 
 # 獨立的 yt-dlp 提取函數
 def run_ytdlp_extraction(url: str, ydl_opts: dict) -> Dict:
     """
-    在獨立行程中執行 yt-dlp 提取。
-    必須為頂層函數以便 pickle 傳遞。
+    在獨立執行緒中執行 yt-dlp 提取。
     """
     try:
-        # 在子行程中建立新的 ydl 實例
+        # 在子執行緒中建立新的 ydl 實例
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
     except Exception as e:
-        # 將異常資訊以可序列化的方式傳回主行程
-        logging.error(f"YTDL-Process-Error for url {url}: {e}", exc_info=True)
+        # 將異常資訊以可序列化的方式傳回主執行緒
+        logging.error(f"YTDL-Thread-Error for url {url}: {e}", exc_info=True)
         return {'_type': 'error', 'error': str(e)}
 
 
@@ -281,10 +281,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 else:
                     ydl_opts['playlistend'] = MAX_PLAYLIST_ITEMS
 
-                # 在行程池中執行 yt-dlp
+                # 在執行緒池中執行 yt-dlp
                 data = await asyncio.wait_for(
                     bot.loop.run_in_executor(
-                        process_executor,
+                        thread_executor,
                         run_ytdlp_extraction,
                         url,
                         ydl_opts
@@ -414,10 +414,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     ydl_opts = YDL_OPTIONS.copy()
                     ydl_opts.update({'playlistend': 1})
                     
-                    # 在行程池中執行 yt-dlp
+                    # 在執行緒池中執行 yt-dlp
                     partial_data = await asyncio.wait_for(
                         bot.loop.run_in_executor(
-                            process_executor,
+                            thread_executor,
                             run_ytdlp_extraction,
                             self.webpage_url,
                             ydl_opts
@@ -447,10 +447,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         return
                     
                     ydl_opts['extract_flat'] = False
-                    # 在行程池中執行 yt-dlp
+                    # 在執行緒池中執行 yt-dlp
                     full_data = await asyncio.wait_for(
                         bot.loop.run_in_executor(
-                            process_executor,
+                            thread_executor,
                             run_ytdlp_extraction,
                             self.webpage_url,
                             ydl_opts
@@ -1584,7 +1584,7 @@ class IdleChecker:
                     break
                 
                 # 如果正在播放，不計為閒置
-                if player._voice_client.is_playing():
+                if player._voice_client.is_playing() or player._voice_client.is_paused():
                     self.reset_timer(guild_id)
                     continue
 
@@ -1697,7 +1697,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("收到關閉信號...")
     finally:
-        # 優雅地關閉行程池
-        logging.info("正在關閉 ProcessPoolExecutor...")
-        process_executor.shutdown(wait=True)
+        # 優雅地關閉執行緒池
+        logging.info("正在關閉 ThreadPoolExecutor...")
+        thread_executor.shutdown(wait=True)
         logging.info("Executor 已關閉。")
