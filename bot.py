@@ -35,7 +35,7 @@ def get_env_value(key: str, default: Any, value_type: type = str) -> Any:
 # 系統配置
 YTDL_TIMEOUT = get_env_value('YTDL_TIMEOUT', 30.0, float)
 CACHE_LIMIT = get_env_value('CACHE_LIMIT', 1000, int)
-MAX_PLAYLIST_ITEMS = get_env_value('MAX_PLAYLIST', 50, int)
+MAX_PLAYLIST = get_env_value('MAX_PLAYLIST', 50, int)
 BUTTON_TIMEOUT_SECONDS = get_env_value('BUTTON_TIMEOUT', 180, int)
 DEFAULT_VOLUME = get_env_value('DEFAULT_VOLUME', 1.0, float)
 MAX_QUEUE_LENGTH = get_env_value('MAX_QUEUE_LENGTH', 100, int)
@@ -277,9 +277,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 
                 if playlist_offset:
                     ydl_opts['playliststart'] = playlist_offset + 1
-                    ydl_opts['playlistend'] = playlist_offset + MAX_PLAYLIST_ITEMS
+                    ydl_opts['playlistend'] = playlist_offset + MAX_PLAYLIST
                 else:
-                    ydl_opts['playlistend'] = MAX_PLAYLIST_ITEMS
+                    ydl_opts['playlistend'] = MAX_PLAYLIST
 
                 # 在執行緒池中執行 yt-dlp
                 data = await asyncio.wait_for(
@@ -340,12 +340,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 entries = data['entries']
                 original_count = len(entries)
                 
-                if playlist_offset and len(entries) > MAX_PLAYLIST_ITEMS:
-                    entries = entries[playlist_offset:playlist_offset+MAX_PLAYLIST_ITEMS]
-                    logger.debug(f"播放清單已被切片: 從 {playlist_offset} 開始，限制為 {MAX_PLAYLIST_ITEMS} 項")
+                if playlist_offset and len(entries) > MAX_PLAYLIST:
+                    entries = entries[playlist_offset:playlist_offset+MAX_PLAYLIST]
+                    logger.debug(f"播放清單已被切片: 從 {playlist_offset} 開始，限制為 {MAX_PLAYLIST} 項")
                 else:
-                    entries = entries[:MAX_PLAYLIST_ITEMS]
-                    if original_count > MAX_PLAYLIST_ITEMS:
+                    entries = entries[:MAX_PLAYLIST]
+                    if original_count > MAX_PLAYLIST:
                         logger.debug(f"播放清單被截斷: {original_count} -> {len(entries)} 項")
                 
                 for entry in entries:
@@ -610,7 +610,7 @@ def parse_playlist_offset(query: str) -> Tuple[str, int]:
     if offset_pattern:
         page_number = int(offset_pattern.group(1))
         if page_number >= 1:
-            playlist_offset = (page_number - 1) * MAX_PLAYLIST_ITEMS
+            playlist_offset = (page_number - 1) * MAX_PLAYLIST
             query = query[:offset_pattern.start()].strip()
             
     return query, playlist_offset
