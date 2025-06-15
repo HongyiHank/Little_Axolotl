@@ -177,7 +177,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
     """處理來自 yt-dlp 的音源，並轉換為 Discord 可播放格式"""
     
     _cache: Dict[str, Dict] = {}
-    _cache_lock = asyncio.Lock()
+    _cache_lock: Optional[asyncio.Lock] = None
     _last_cache_cleanup = 0
     __slots__ = ('original', 'data', 'title', 'duration', 'url', 'lazy', 
                  'webpage_url', '_is_prepared', '_prepare_lock')
@@ -210,6 +210,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
             return
         
         try:
+            if cls._cache_lock is None:
+                cls._cache_lock = asyncio.Lock()
+            
             async with cls._cache_lock:
                 initial_size = len(cls._cache)
                 
@@ -256,6 +259,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
         
         cache_key = f"{url}__{playlist_offset}"
         
+        if cls._cache_lock is None:
+            cls._cache_lock = asyncio.Lock()
+            
         try:
             async with cls._cache_lock:
                 if cache_key in cls._cache:
