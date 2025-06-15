@@ -1,0 +1,12 @@
+Little_Axolotl/
+├── .env
+├── main.py             # 機器人主入口點
+├── cogs/
+│   └── music.py        # 音樂功能的核心 Cog
+├── sources/
+│   └── youtube.py      # 處理 YouTube 來源的專用模組
+└── utils/
+    ├── __init__.py     # 入口點
+    ├── config.py       # 存放所有環境變數和設定
+    ├── errors.py       # 存放自訂的錯誤類別
+    └── player.py       # 存放 GuildMusicPlayer 狀態類別
